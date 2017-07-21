@@ -1567,7 +1567,7 @@ free_cmd:
 	free(writecmd);
 	free(state);
 	pthread_mutex_lock(&rdev->format_lock);
-	rdev->flags &= ~TCMUR_DEV_FORMATTING;
+	rdev->flags &= ~TCMUR_DEV_FLAG_FORMATTING;
 	pthread_mutex_unlock(&rdev->format_lock);
 	aio_command_finish(dev, origcmd, ret);
 }
@@ -1583,14 +1583,14 @@ static int handle_format_unit(struct tcmu_device *dev, struct tcmulib_cmd *cmd) 
 	int ret;
 
 	pthread_mutex_lock(&rdev->format_lock);
-	if (rdev->flags & TCMUR_DEV_FORMATTING) {
+	if (rdev->flags & TCMUR_DEV_FLAG_FORMATTING) {
 		pthread_mutex_unlock(&rdev->format_lock);
 		return tcmu_set_sense_data(sense, NOT_READY,
 					  ASC_NOT_READY_FORMAT_IN_PROGRESS,
 					  &rdev->format_progress);
 	}
 	rdev->format_progress = 0;
-	rdev->flags |= TCMUR_DEV_FORMATTING;
+	rdev->flags |= TCMUR_DEV_FLAG_FORMATTING;
 	pthread_mutex_unlock(&rdev->format_lock);
 
 	writecmd = calloc(1, sizeof(*writecmd));
@@ -1638,7 +1638,7 @@ free_cmd:
 	free(writecmd);
 clear_format:
 	pthread_mutex_lock(&rdev->format_lock);
-	rdev->flags &= ~TCMUR_DEV_FORMATTING;
+	rdev->flags &= ~TCMUR_DEV_FLAG_FORMATTING;
 	pthread_mutex_unlock(&rdev->format_lock);
 	return SAM_STAT_TASK_SET_FULL;
 }
@@ -1895,7 +1895,7 @@ int tcmur_generic_handle_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
 	struct tcmur_handler *rhandler = tcmu_get_runner_handler(dev);
 	int ret;
 
-	if (rdev->flags & TCMUR_DEV_FORMATTING && cmd->cdb[0] != INQUIRY)
+	if (rdev->flags & TCMUR_DEV_FLAG_FORMATTING && cmd->cdb[0] != INQUIRY)
 		return tcmu_set_sense_data(cmd->sense_buf, NOT_READY,
 					   ASC_NOT_READY_FORMAT_IN_PROGRESS,
 					   &rdev->format_progress);
