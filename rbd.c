@@ -58,6 +58,7 @@ struct tcmu_rbd_state {
 
 	char *image_name;
 	char *pool_name;
+	char *osd_op_timeout;
 
 	pthread_spinlock_t lock;	/* protect state */
 	int state;
@@ -126,6 +127,12 @@ static int tcmu_rbd_image_open(struct tcmu_device *dev)
 	/* Fow now, we will only read /etc/ceph/ceph.conf */
 	rados_conf_read_file(state->cluster, NULL);
 	rados_conf_set(state->cluster, "rbd_cache", "false");
+	ret = rados_conf_set(state->cluster, "rados_osd_op_timeout",
+			     state->osd_op_timeout);
+	if (ret < 0) {
+		tcmu_dev_err(dev, "Could not set rados osd op timeout to %s (Err %d. Failover may be delayed.)\n",
+			     state->osd_op_timeout, ret);
+	}
 
 	ret = rados_connect(state->cluster);
 	if (ret < 0) {
@@ -347,6 +354,8 @@ static void tcmu_rbd_state_free(struct tcmu_rbd_state *state)
 {
 	pthread_spin_destroy(&state->lock);
 
+	if (state->osd_op_timeout)
+		free(state->osd_op_timeout);
 	if (state->image_name)
 		free(state->image_name);
 	if (state->pool_name)
@@ -357,7 +366,7 @@ static void tcmu_rbd_state_free(struct tcmu_rbd_state *state)
 static int tcmu_rbd_open(struct tcmu_device *dev)
 {
 	rbd_image_info_t image_info;
-	char *pool, *name;
+	char *pool, *name, *next_opt;
 	char *config, *dev_cfg_dup;
 	struct tcmu_rbd_state *state;
 	uint64_t rbd_size;
@@ -418,6 +427,20 @@ static int tcmu_rbd_open(struct tcmu_device *dev)
 		goto free_config;
 	}
 
+	/* The next options are optional */
+	next_opt = strtok(NULL, "/");
+	if (next_opt) {
+		if (!strncmp(next_opt, "osd_op_timeout=", 15)) {
+			state->osd_op_timeout = strdup(next_opt + 15);
+			if (!state->osd_op_timeout ||
+			    !strlen(state->osd_op_timeout)) {
+				ret = -ENOMEM;
+				tcmu_dev_err(dev, "Could not copy osd op timeout.\n");
+				goto free_config;
+			}
+		}
+	}
+
 	ret = tcmu_rbd_image_open(dev);
 	if (ret < 0) {
 		goto free_config;
@@ -469,6 +492,51 @@ static void tcmu_rbd_close(struct tcmu_device *dev)
 }
 
 /*
+ * Tmp hack. We really want to disconnect ceph tcp connections with TCP
+ * USER timeout set really low or SO_LINGER=0 (if that setting does
+ * really kill the retry queue and immediately send a RST) then do
+ * new function that works like rados_op_cancel and then close and reopen
+ * the image.
+ *
+ * We don't have that so we kill the box. The initiator multipath layer
+ * will handle like a normal node down.
+ */
+static void tcmu_reboot(void)
+{
+	char *reboot = "b";
+	int fd, ret;
+
+	fd = open("/proc/sysrq-trigger", O_WRONLY);
+	if (fd < 0) {
+		tcmu_err("Could not open sysrq to reboot. Error %d.\n", errno);
+		return;
+	}
+
+	ret = write(fd, reboot, 1);
+	if (ret <= 0) {
+		tcmu_err("Could not write to sysrq to reboot. Error %d\n",
+			 errno);
+		goto close;
+	}
+close:
+	close(fd);
+}
+
+static int tcmu_rbd_handle_timedout_cmd(struct tcmu_device *dev,
+					struct tcmulib_cmd *cmd)
+{
+	tcmu_dev_err(dev, "timing out cmd.\n");
+	tcmu_reboot();
+
+	/*
+	 * TODO: When we can do a clean fast client restart fail cmd below.
+	 * We are going to kill the iscsi connection, so return a retryable
+	 * error and let the initiator multipath layer retry.
+	 */
+	return SAM_STAT_BUSY;
+}
+
+/*
  * NOTE: RBD async APIs almost always return 0 (success), except
  * when allocation (via new) fails - which is not caught. So,
  * the only errno we've to bother about as of now are memory
@@ -488,7 +556,9 @@ static void rbd_finish_aio_read(rbd_completion_t completion,
 	ret = rbd_aio_get_return_value(completion);
 	rbd_aio_release(completion);
 
-	if (ret == -ESHUTDOWN) {
+	if (ret == -ETIMEDOUT) {
+		tcmu_r = tcmu_rbd_handle_timedout_cmd(dev, tcmulib_cmd);
+	} else if (ret == -ESHUTDOWN) {
 		tcmu_r = tcmu_set_sense_data(tcmulib_cmd->sense_buf,
 					     NOT_READY, ASC_PORT_IN_STANDBY,
 					     NULL);
@@ -567,11 +637,13 @@ static void rbd_finish_aio_generic(rbd_completion_t completion,
 	ret = rbd_aio_get_return_value(completion);
 	rbd_aio_release(completion);
 
-	if (ret == -ESHUTDOWN) {
+	if (ret == -ETIMEDOUT) {
+		tcmu_r = tcmu_rbd_handle_timedout_cmd(dev, tcmulib_cmd);
+	} else if (ret == -ESHUTDOWN) {
 		tcmu_r = tcmu_set_sense_data(tcmulib_cmd->sense_buf,
 					     NOT_READY, ASC_PORT_IN_STANDBY,
 					     NULL);
-	} else if (ret < 0) {
+		} else if (ret < 0) {
 		tcmu_r = tcmu_set_sense_data(tcmulib_cmd->sense_buf,
 					     MEDIUM_ERROR, ASC_WRITE_ERROR,
 					     NULL);
@@ -685,7 +757,7 @@ out:
  *
  * Specify poolname/devicename, e.g,
  *
- * $ targetcli create /backstores/user:rbd/test 2G rbd/test
+ * $ targetcli create /backstores/user:rbd/test 2G rbd/test/osd_op_timeout=30
  *
  * poolname must be the name of an existing rados pool.
  *
@@ -693,7 +765,7 @@ out:
  */
 static const char tcmu_rbd_cfg_desc[] =
 	"RBD config string is of the form:\n"
-	"poolname/devicename\n"
+	"poolname/devicename/optional osd_op_timeout=N secs\n"
 	"where:\n"
 	"poolname:	Existing RADOS pool\n"
 	"devicename:	Name of the RBD image\n";
