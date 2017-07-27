@@ -19,7 +19,10 @@
 
 #include "tcmur_aio.h"
 
-#define TCMUR_DEV_FLAG_FORMATTING	0x01
+#define TCMUR_DEV_FLAG_FORMATTING	(1 << 0)
+#define TMCUR_DEV_FLAG_FO_USE_IMPLICIT	(1 << 1)
+#define TMCUR_DEV_FLAG_FO_USE_EXPLICIT	(1 << 2)
+#define TMCUR_DEV_FLAG_FO_USE_AA	(1 << 3)
 
 struct tcmur_device {
 	/* TCMUR_DEV flags */

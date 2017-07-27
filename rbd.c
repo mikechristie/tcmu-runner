@@ -34,6 +34,7 @@
 
 #include "tcmu-runner.h"
 #include "libtcmu.h"
+#include "tcmur_device.h"
 
 #include <rbd/librbd.h>
 
@@ -365,6 +366,7 @@ static void tcmu_rbd_state_free(struct tcmu_rbd_state *state)
 
 static int tcmu_rbd_open(struct tcmu_device *dev)
 {
+	struct tcmur_device *rdev = tcmu_get_daemon_dev_private(dev);
 	rbd_image_info_t image_info;
 	char *pool, *name, *next_opt;
 	char *config, *dev_cfg_dup;
@@ -439,6 +441,10 @@ static int tcmu_rbd_open(struct tcmu_device *dev)
 				goto free_config;
 			}
 		}
+	}
+
+	if (rdev->flags & TMCUR_DEV_FLAG_FO_USE_AA && !state->osd_op_timeout) {
+		tcmu_dev_warn(dev, "rados osd op timeout not set, but active/active enabled.\n")
 	}
 
 	ret = tcmu_rbd_image_open(dev);

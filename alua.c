@@ -30,6 +30,7 @@
 #include "libtcmu_log.h"
 #include "libtcmu_common.h"
 #include "libtcmu_priv.h"
+#include "tcmur_device.h"
 #include "alua.h"
 
 static int tcmu_get_tpgt_int(struct tgt_port *port, const char *name)
@@ -183,6 +184,7 @@ static void tcmu_free_tgt_port_grp(struct tgt_port_grp *group)
 static struct tgt_port_grp *
 tcmu_get_tgt_port_grp(struct tcmu_device *dev, const char *name)
 {
+	struct tcmur_device *rdev = tcmu_get_daemon_dev_private(dev);
 	struct tgt_port_grp *group;
 	struct tgt_port *port;
 	char *str_val, *orig_str_val, *member;
@@ -288,16 +290,34 @@ tcmu_get_tgt_port_grp(struct tcmu_device *dev, const char *name)
 	if (!str_val)
 		goto free_group;
 
-	if (!strcmp(str_val, "None"))
-		group->tpgs = TPGS_ALUA_NONE;
-	else if (!strcmp(str_val, "Implicit"))
+	if (!strcmp(str_val, "None")) {
+		rdev->flags &= ~(TMCUR_DEV_FLAG_FO_USE_IMPLICIT |
+				 TMCUR_DEV_FLAG_FO_USE_EXPLICIT);
+		rdev->flags |= TMCUR_DEV_FLAG_FO_USE_AA;
+		/*
+		 * we still want the initiator to use RTPG and we
+		 * can manually change states, so report this as
+		 * implicit.
+		 */
 		group->tpgs = TPGS_ALUA_IMPLICIT;
-	else if (!strcmp(str_val, "Explicit"))
+	} else if (!strcmp(str_val, "Implicit")) {
+		group->tpgs = TPGS_ALUA_IMPLICIT;
+		rdev->flags |= TMCUR_DEV_FLAG_FO_USE_IMPLICIT;
+		rdev->flags &= ~TMCUR_DEV_FLAG_FO_USE_EXPLICIT;
+	} else if (!strcmp(str_val, "Explicit")) {
 		group->tpgs = TPGS_ALUA_EXPLICIT;
-	else if (!strcmp(str_val, "Implicit and Explicit"))
+		rdev->flags |= TMCUR_DEV_FLAG_FO_USE_EXPLICIT;
+		rdev->flags &= ~TMCUR_DEV_FLAG_FO_USE_IMPLICIT;
+	} else if (!strcmp(str_val, "Implicit and Explicit")) {
 		group->tpgs = (TPGS_ALUA_IMPLICIT | TPGS_ALUA_EXPLICIT);
-	else
+		/*
+		 * Assume explicit because implicit had to be set
+		 * on older kernels for explicit.
+		 */
+		rdev->flags |= TMCUR_DEV_FLAG_FO_USE_EXPLICIT;
+	} else {
 		tcmu_err("Invalid ALUA type %s", str_val);
+	}
 	free(str_val);
 
 	str_val = orig_str_val = tcmu_get_alua_str_setting(group, "members");
@@ -536,13 +556,19 @@ static int tcmu_report_state(struct tcmu_device *dev,
 			     struct tgt_port_grp *group)
 {
 	struct tcmur_handler *rhandler = tcmu_get_runner_handler(dev);
+	struct tcmur_device *rdev = tcmu_get_daemon_dev_private(dev);
 	int ret;
 
-	/* TODO: For ESX return remote ports */
-
-	if (!rhandler->has_lock)
+	/*
+	 * For implicit and active/active we currently assume the states do
+	 * not change. This is a simplification for ESX where we would need to
+	 * return remote port state changes.
+	 */
+	if (!rhandler->has_lock ||
+	    !(rdev->flags & TMCUR_DEV_FLAG_FO_USE_EXPLICIT))
 		return group->state;
 
+	/* TODO: For ESX return remote ports */
 	ret = rhandler->has_lock(dev);
 	if (ret == TCMUR_LOCK_FAILED) {
 		return ALUA_ACCESS_STATE_STANDBY;
