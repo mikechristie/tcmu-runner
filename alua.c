@@ -471,7 +471,7 @@ static int tcmu_do_transition(struct tcmu_device *dev,
 	case ALUA_ACCESS_STATE_OFFLINE:
 		if (rhandler->unlock) {
 			ret = rhandler->unlock(dev);
-			if (ret < 0)
+			if (ret == TCMUR_LOCK_FAILED)
 				/*
 				 * Return success even though we failed. The initiator
 				 * will send a STPG to the port it wants to activate,
@@ -544,7 +544,7 @@ static int tcmu_report_state(struct tcmu_device *dev,
 		return group->state;
 
 	ret = rhandler->has_lock(dev);
-	if (ret <= 0) {
+	if (ret == TCMUR_LOCK_FAILED) {
 		return ALUA_ACCESS_STATE_STANDBY;
 	} else {
 		return ALUA_ACCESS_STATE_OPTIMIZED;

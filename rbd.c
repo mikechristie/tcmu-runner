@@ -170,20 +170,14 @@ set_closed:
 
 #ifdef RBD_LOCK_ACQUIRE_SUPPORT
 
-/*
- * Returns:
- * 0 = client is not owner.
- * 1 = client is owner.
- * -ESHUTDOWN/-EBLACKLISTED(-108) = client is blacklisted.
- * -EIO = misc error.
- */
-static int tcmu_rbd_has_lock(struct tcmu_device *dev)
+static int has_lock(struct tcmu_device *dev)
 {
 	struct tcmu_rbd_state *state = tcmu_get_dev_private(dev);
 	int ret, is_owner;
 
 	ret = rbd_is_exclusive_lock_owner(state->image, &is_owner);
 	if (ret == -ESHUTDOWN) {
+ 		/* -ESHUTDOWN/-EBLACKLISTED(-108) = client is blacklisted. */
 		return ret;
 	} else if (ret < 0) {
 		/* let initiator figure things out */
@@ -196,6 +190,14 @@ static int tcmu_rbd_has_lock(struct tcmu_device *dev)
 	tcmu_dev_dbg(dev, "Not owner\n");
 
 	return 0;
+}
+
+static int tcmu_rbd_has_lock(struct tcmu_device *dev)
+{
+	if (has_lock(dev) <= 0)
+		return TCMUR_LOCK_FAILED;
+
+	return TCMUR_LOCK_SUCCESS;
 }
 
 static int tcmu_rbd_image_reopen(struct tcmu_device *dev)
@@ -291,7 +293,7 @@ static int tcmu_rbd_lock(struct tcmu_device *dev)
 	 * Or, set to transitioning and grab the lock in the background.
 	 */
 	while (attempts++ < 5) {
-		ret = tcmu_rbd_has_lock(dev);
+		ret = has_lock(dev);
 		if (ret == 1) {
 			ret = 0;
 			break;
@@ -324,13 +326,19 @@ static int tcmu_rbd_lock(struct tcmu_device *dev)
 	if (orig_owner)
 		free(orig_owner);
 
-	return ret;
+	if (ret)
+		return TCMUR_LOCK_FAILED;
+	else
+		return TCMUR_LOCK_SUCCESS;
 }
 
 static int tcmu_rbd_unlock(struct tcmu_device *dev)
 {
 	struct tcmu_rbd_state *state = tcmu_get_dev_private(dev);
-	return rbd_lock_release(state->image);
+
+	if (rbd_lock_release(state->image))
+		return TCMUR_LOCK_FAILED;
+	return TCMUR_LOCK_SUCCESS;
 }
 
 #endif

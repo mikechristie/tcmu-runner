@@ -41,6 +41,11 @@ typedef int (*handle_cmd_fn_t)(struct tcmu_device *, struct tcmulib_cmd *);
 
 struct tcmulib_cfg_info;
 
+enum {
+	TCMUR_LOCK_SUCCESS,
+	TCMUR_LOCK_FAILED,
+};
+
 struct tcmur_handler {
 	const char *name;	/* Human-friendly name */
 	const char *subtype;	/* Name for cfgstring matching */
@@ -112,8 +117,16 @@ struct tcmur_handler {
 	rw_fn_t write;
 	rw_fn_t read;
 	flush_fn_t flush;
+
+	/*
+	 * lock and unlock must return a TCMUR_LOCK return value;
+	 */
 	int (*lock)(struct tcmu_device *dev);
 	int (*unlock)(struct tcmu_device *dev);
+	/*
+	 * If the lock is held return TCMUR_LOCK_SUCCESS.
+	 * If not held return TCMUR_LOCK_FAILED.
+	 */
 	int (*has_lock)(struct tcmu_device *dev);
 
 	/*
