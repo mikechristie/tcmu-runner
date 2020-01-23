@@ -22,6 +22,8 @@
 #include <endian.h>
 #include <errno.h>
 #include <pthread.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
 
 #include <scsi/scsi.h>
 
@@ -80,6 +82,11 @@ struct tcmu_rbd_state {
 	char *osd_op_timeout;
 	char *conf_path;
 	char *id;
+};
+
+struct ip_info {
+	struct list_node entry;
+	char addr_str[INET6_ADDRSTRLEN];
 };
 
 enum rbd_aio_type {
@@ -343,6 +350,203 @@ static void tcmu_rbd_detect_device_class(struct tcmu_device *dev)
 	free(crush_rule);
 }
 
+static int tcmu_rbd_rm_from_bl(struct tcmu_device *dev, const char *addr)
+{
+	struct tcmu_rbd_state *state = tcmur_dev_get_private(dev);
+	char *stat = NULL, *cmd_str;
+	size_t stat_len = 0;
+	const char *cmd[2];
+	int ret;
+
+	ret = asprintf(&cmd_str, "{\"prefix\": \"osd blacklist\", \"blacklistop\": \"rm\", \"addr\": \"%s\"}",
+		       addr);
+	if (ret == -1)
+		return -ENOMEM;
+
+	cmd[0] = cmd_str;
+	cmd[1] = NULL;
+
+	ret = rados_mon_command(state->cluster, (const char **)cmd, 1, "", 0,
+				NULL, NULL, &stat, &stat_len);
+	if (ret < 0) {
+		tcmu_dev_err(dev, "Failed to remove blacklist for %s. Error (%d): %s",
+			     addr, ret, stat ? stat : "unknown");
+		goto free_stat;
+	}
+
+	tcmu_dev_info(dev, "Blackilst entry for %s removed.\n", addr);
+free_stat:
+	rados_buffer_free(stat);
+	free(cmd_str);
+	return ret;
+}
+
+static char *parse_client_addr(char *bl_entry, char *ip)
+{
+	char *bl_start = bl_entry;
+
+	/*
+	 * Our bl entry has the format:
+	 *
+	 * ip:port/nonce year-month-date time
+	 *
+	 * We only want the ip:port/nonce.
+	 */
+	while (*bl_entry != '\0' && *ip != '\0') {
+		if (*bl_entry != *ip)
+			return NULL;
+		bl_entry++;
+		ip++;
+	}
+
+	if (*bl_entry == '\0' && *ip != '\0')
+		/*
+		 * The bl entry has our IP, but doesn't have the port/nonce,
+		 * so ignore it. The user or some other app must have added
+		 * it.
+		 */
+		return NULL;
+
+	/* drop the date part of the client addr */
+	while (*bl_entry != '\0') {
+		if (*bl_entry == ' ') {
+			*bl_entry = '\0';
+			return bl_start;
+		}
+
+		bl_entry++;
+	}
+
+	return NULL;
+}
+
+static int tcmu_rbd_rm_ips_from_bl(struct tcmu_device *dev,
+				   struct list_head *ip_list)
+{
+	struct tcmu_rbd_state *state = tcmur_dev_get_private(dev);
+	char *stat = NULL, *bl_buf = NULL, *cmd_str;
+	size_t stat_len = 0, bl_buf_len = 0;
+	struct ip_info *ip;
+	const char *cmd[2];
+	char *line;
+	int ret;
+
+	ret = asprintf(&cmd_str, "{\"prefix\": \"osd blacklist ls\"}");
+	if (ret == -1)
+		return -ENOMEM;
+
+	cmd[0] = cmd_str;
+	cmd[1] = NULL;
+
+	ret = rados_mon_command(state->cluster, (const char **)cmd, 1, "", 0,
+				&bl_buf, &bl_buf_len, &stat, &stat_len);
+	if (ret < 0) {
+		tcmu_dev_err(dev, "Failed to get blacklist. Error (%d): %s",
+			     ret, stat ? stat : "unknown");
+		goto free_stat;
+	}
+
+	while ((line = strsep(&bl_buf, "\n"))) {
+		list_for_each(ip_list, ip, entry) {
+			char *bl_client_addr;
+
+			bl_client_addr = parse_client_addr(line, ip->addr_str);
+			if (bl_client_addr) {
+				tcmu_rbd_rm_from_bl(dev, bl_client_addr);
+				break;
+			}
+		}
+	}
+
+	if (bl_buf)
+		rados_buffer_free(bl_buf);
+free_stat:
+	if (stat)
+		rados_buffer_free(stat);
+	free(cmd_str);
+	return ret;
+}
+
+static int tcmu_rbd_cleanup_bl(struct tcmu_device *dev)
+{
+	struct ifaddrs *ifap, *ifa;
+	struct sockaddr_in *s4;
+	struct sockaddr_in6 *s6;
+	struct list_head ip_list;
+	struct ip_info *ip, *next_ip;
+	int rc = 0;
+
+	list_head_init(&ip_list);
+
+	if (getifaddrs(&ifap)) {
+		tcmu_dev_err(dev, "Could not get IP list. getifaddrs failed %d",
+			     errno);
+		return -errno;
+	}
+
+	/*
+	 * We don't know which addresses got used for ceph, so get a list
+	 * and if we find a blacklist entry for the image then we know its
+	 * from us.
+	 */
+	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
+		if (!ifa->ifa_addr)
+			continue;
+
+		switch (ifa->ifa_addr->sa_family) {
+		case AF_INET:
+		case AF_INET6:
+			break;
+		default:
+			continue;
+		}
+
+		ip = calloc(1, sizeof(*ip));
+		if (!ip) {
+			rc = -ENOMEM;
+			goto free_ips;
+		}
+
+		list_node_init(&ip->entry);
+		list_add_tail(&ip_list, &ip->entry);
+
+		switch (ifa->ifa_addr->sa_family) {
+		case AF_INET:
+			s4 = (struct sockaddr_in *)(ifa->ifa_addr);
+
+			if (!inet_ntop(ifa->ifa_addr->sa_family,
+			    (void *)&(s4->sin_addr), ip->addr_str,
+			    INET_ADDRSTRLEN)) {
+				rc = -errno;
+				goto free_ips;
+			}
+			break;
+		case AF_INET6:
+			s6 = (struct sockaddr_in6 *)(ifa->ifa_addr);
+
+			if (!inet_ntop(ifa->ifa_addr->sa_family,
+			    (void *)&(s6->sin6_addr), ip->addr_str,
+			    INET6_ADDRSTRLEN)) {
+				rc = -errno;
+				goto free_ips;
+			}
+			break;
+		}
+	}
+
+	if (!list_empty(&ip_list))
+		tcmu_rbd_rm_ips_from_bl(dev, &ip_list);
+
+free_ips:
+	list_for_each_safe(&ip_list, ip, next_ip, entry) {
+		list_del(&ip->entry);
+		free(ip);
+	}
+
+	freeifaddrs(ifap);
+	return rc;
+}
+
 static void tcmu_rbd_image_close(struct tcmu_device *dev)
 {
 	struct tcmu_rbd_state *state = tcmur_dev_get_private(dev);
@@ -481,6 +685,7 @@ static int tcmu_rbd_image_open(struct tcmu_device *dev)
 	if (ret < 0)
 		goto rbd_close;
 
+	tcmu_rbd_cleanup_bl(dev);
 	return 0;
 
 rbd_close:
